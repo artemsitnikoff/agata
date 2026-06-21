@@ -2,7 +2,8 @@ import asyncio
 import logging
 import time
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Security
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 from app.config import settings
@@ -12,6 +13,13 @@ router = APIRouter()
 
 
 # ── auth ──────────────────────────────────────────────────────────────────
+
+# Security-схема: даёт кнопку «Authorize 🔒» в Swagger UI для заголовка X-API-Token.
+api_key_header = APIKeyHeader(
+    name="X-API-Token",
+    auto_error=False,
+    description="Общий секрет (значение API_TOKEN на сервере).",
+)
 
 
 def _check_token(token: str | None) -> None:
@@ -75,12 +83,46 @@ class AskResponse(BaseModel):
     "/ask",
     response_model=AskResponse,
     summary="Написать боту и дождаться ответа",
+    description=(
+        "Отправляет `text` целевому боту от личного аккаунта и ждёт его ответ. "
+        "Бот может прислать несколько сообщений — они собираются в `replies` "
+        "(и склеенными в `reply`). Диалоги с ботом сериализуются, так что "
+        "параллельные запросы выполняются по очереди."
+    ),
     tags=["userbot"],
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Успех": {
+                            "value": {
+                                "ok": True,
+                                "replies": ["Привет! Я бот.", "Выберите действие:"],
+                                "reply": "Привет! Я бот.\n\nВыберите действие:",
+                                "elapsed": 1.42,
+                                "error": None,
+                            },
+                        },
+                        "Бот не ответил": {
+                            "value": {
+                                "ok": False, "replies": [], "reply": "",
+                                "elapsed": 60.0,
+                                "error": "Бот не ответил в отведённое время",
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        403: {"description": "Неверный X-API-Token"},
+        503: {"description": "Userbot не подключён"},
+    },
 )
 async def ask(
     body: AskRequest,
     request: Request,
-    x_api_token: str | None = Header(None, description="Токен авторизации"),
+    x_api_token: str | None = Security(api_key_header),
 ):
     _check_token(x_api_token)
     userbot = _get_userbot(request)
@@ -135,7 +177,7 @@ class SendResponse(BaseModel):
 async def send(
     body: SendRequest,
     request: Request,
-    x_api_token: str | None = Header(None, description="Токен авторизации"),
+    x_api_token: str | None = Security(api_key_header),
 ):
     _check_token(x_api_token)
     userbot = _get_userbot(request)
