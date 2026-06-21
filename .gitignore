@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Секреты — НИКОГДА не коммитим (полный доступ к аккаунту/боту)
+.env
+data/.telethon_session
+*.session
+*.session-journal
+
+.DS_Store
+server.log

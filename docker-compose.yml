@@ -1,0 +1,11 @@
+services:
+  agata:
+    build: .
+    container_name: agata
+    ports:
+      - "8042:8042"
+    env_file:
+      - .env
+    volumes:
+      - ./.env:/app/.env:ro
+    restart: unless-stopped
