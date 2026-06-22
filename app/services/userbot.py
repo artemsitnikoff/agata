@@ -263,16 +263,15 @@ class UserbotClient:
                 raise
             finally:
                 # Диалог уже вышел из контекста (__aexit__ снял футуры с диспатча и
-                # отменил их) — здесь лишь подбираем отменённые задачи, чтобы asyncio
-                # не ругался на «никто не забрал результат».
-                for task in (resp, edit):
-                    if task is None:
-                        continue
-                    task.cancel()
-                    try:
-                        await task
-                    except Exception:  # Exception (не BaseException) — чтобы не
-                        pass           # глотать CancelledError самого ask()
+                # отменил их). Подбираем отменённые задачи через gather(return_exceptions):
+                # он ГЛОТАЕТ CancelledError самих задач (это наша же отмена при очистке —
+                # await task иначе всегда бросал бы её, т.к. CancelledError ⊄ Exception),
+                # но ПРОБРАСЫВАЕТ отмену, если отменяют сам ask() (отвал клиента).
+                cleanup = [t for t in (resp, edit) if t is not None]
+                for t in cleanup:
+                    t.cancel()
+                if cleanup:
+                    await asyncio.gather(*cleanup, return_exceptions=True)
 
             texts = [by_id[i] for i in order if by_id[i]]
             meaningful = [t for t in texts if not _looks_like_placeholder(t)]
