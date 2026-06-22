@@ -10,6 +10,7 @@ TELETHON_SESSION), а не от бота.
 import asyncio
 import logging
 import random
+import re
 import time
 
 from telethon import TelegramClient, events
@@ -25,25 +26,80 @@ logger = logging.getLogger("agata")
 # Кулдаун на чат — чтобы личный аккаунт не улетел во флуд/бан Telegram.
 SENECA_COOLDOWN_SECONDS = 60
 
-# Маркеры «сообщения-заглушки»: бот прислал плейсхолдер и ещё думает. Пока ответ
-# состоит только из таких сообщений — ждём правку/финал (см. ask_edit_timeout).
-# Сравнение по подстроке в lower(), поэтому маркеры — характерные фразы загрузки,
-# а не эмодзи (эмодзи может оказаться и в реальном ответе → лишнее ожидание).
-PLACEHOLDER_MARKERS = (
-    "подожд",            # «пожалуйста, подождите»
-    "идёт поиск", "идет поиск",
-    "идёт обработ", "идет обработ",
-    "выполняется", "обрабатыва",
-    "загруж",            # «загружаю / загрузка»
-    "ищу", "минуточк", "один момент", "одну секунд", "секундочк",
-    "please wait", "loading", "searching", "processing", "one moment",
+# Сообщение считаем временной заглушкой «бот ещё думает», только если оно КОРОТКОЕ
+# (реальный ответ — длинный структурированный текст) И содержит характерную фразу
+# загрузки на границах слов. Короткий порог — главная защита от ложных срабатываний
+# на словах вроде «обрабатывается»/«загруженность» внутри настоящего ответа; границы
+# слов (\b) — от «ищу»⊂«поищу», «loading»⊂«downloading» и т.п.
+PLACEHOLDER_MAX_LEN = 120
+_PLACEHOLDER_RE = re.compile(
+    r"\b(?:"
+    r"подожди\w*"                          # подождите / подожди
+    r"|ид[её]т\s+поиск\w*"                 # идёт поиск
+    r"|ид[её]т\s+обработк\w*"              # идёт обработка
+    r"|ид[её]т\s+загрузк\w*|загружа\w+"    # идёт загрузка / загружаю
+    r"|выполня\w+\s+поиск\w*"              # выполняю поиск
+    r"|минуточк\w*|секундочк\w*"           # минуточку / секундочку
+    r"|одну?\s+секунд\w*|один\s+момент"    # одну секунду / один момент
+    r"|please\s+wait|one\s+moment|loading|searching|processing"
+    r")\b",
+    re.IGNORECASE,
 )
 
 
 def _looks_like_placeholder(text: str) -> bool:
-    """True, если текст похож на временную заглушку «идёт поиск… подождите»."""
-    low = text.lower()
-    return any(marker in low for marker in PLACEHOLDER_MARKERS)
+    """True, если текст — короткая временная заглушка «идёт поиск… подождите».
+
+    Длинные сообщения никогда не заглушки, даже если содержат слово вроде
+    «обрабатывается» — это убирает почти все ложные срабатывания.
+    """
+    stripped = text.strip()
+    if not stripped or len(stripped) > PLACEHOLDER_MAX_LEN:
+        return False
+    return bool(_PLACEHOLDER_RE.search(stripped))
+
+
+def _extract_links(msg) -> list[str]:
+    """Ссылки из inline-кнопок и скрытых гиперссылок сообщения.
+
+    raw_text НЕ содержит URL кнопок (📂 «полный отчёт») и подменённых текстовых
+    ссылок — добираем их, иначе ссылка теряется. Дедуп по URL.
+    """
+    links: list[str] = []
+    seen: set[str] = set()
+
+    def _add(label: str, url: str | None) -> None:
+        if not url or url in seen:
+            return
+        seen.add(url)
+        label = (label or "").strip()
+        links.append(f"{label} ({url})" if label and label not in url else url)
+
+    # URL-кнопки inline-клавиатуры (берём из reply_markup напрямую — не зависит от
+    # client/chat, в отличие от msg.buttons).
+    rows = getattr(getattr(msg, "reply_markup", None), "rows", None) or []
+    for row in rows:
+        for btn in getattr(row, "buttons", None) or []:
+            _add(getattr(btn, "text", ""), getattr(btn, "url", None))
+
+    # Скрытые текстовые гиперссылки (видимый текст ≠ адрес; смещения entity в UTF-16
+    # корректно разруливает get_entities_text).
+    try:
+        for ent, inner in (msg.get_entities_text() or []):
+            _add(inner, getattr(ent, "url", None))
+    except Exception:  # pragma: no cover — на случай смены API Telethon
+        pass
+
+    return links
+
+
+def _extract_text(msg) -> str:
+    """Текст сообщения + дописанные в скобках ссылки из кнопок/гиперссылок."""
+    text = (msg.raw_text or "").strip()
+    links = _extract_links(msg)
+    if links:
+        text = (text + "\n" + "\n".join(links)).strip()
+    return text
 
 
 class UserbotClient:
@@ -137,7 +193,7 @@ class UserbotClient:
             def _record(msg) -> None:
                 if msg.id not in by_id:
                     order.append(msg.id)
-                by_id[msg.id] = msg.raw_text or ""
+                by_id[msg.id] = _extract_text(msg)
 
             resp = edit = None
             try:
@@ -158,8 +214,11 @@ class UserbotClient:
 
                     edit_deadline = time.monotonic() + edit_timeout
                     while True:
+                        # Пустой текст (медиа без подписи) тоже считаем «ещё не
+                        # ответил» — ждём правку/подпись, а не выходим сразу.
                         only_placeholder = bool(by_id) and all(
-                            _looks_like_placeholder(t) for t in by_id.values()
+                            (not t) or _looks_like_placeholder(t)
+                            for t in by_id.values()
                         )
                         if only_placeholder:
                             budget = edit_deadline - time.monotonic()
@@ -192,6 +251,13 @@ class UserbotClient:
                                 edit = asyncio.ensure_future(conv.get_edit(timeout=inner))
                         if not progressed:  # обе задачи истекли по внутреннему таймауту
                             break
+
+                    # Подстраховка: финальная правка могла прийти в зазор перевзвода
+                    # (та же секунда — строгое '>' в get_edit её пропускает). Берём
+                    # самый свежий текст каждого сообщения прямо из буфера диалога.
+                    for m in getattr(conv, "_incoming", None) or []:
+                        if m.id in by_id:
+                            by_id[m.id] = _extract_text(m)
             except (PeerFloodError, FloodWaitError):
                 logger.error("Userbot: Telegram rate-limit/flood при ask")
                 raise
@@ -205,8 +271,8 @@ class UserbotClient:
                     task.cancel()
                     try:
                         await task
-                    except BaseException:
-                        pass
+                    except Exception:  # Exception (не BaseException) — чтобы не
+                        pass           # глотать CancelledError самого ask()
 
             texts = [by_id[i] for i in order if by_id[i]]
             meaningful = [t for t in texts if not _looks_like_placeholder(t)]
