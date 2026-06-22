@@ -69,6 +69,15 @@ class AskRequest(BaseModel):
     collect_seconds: float | None = Field(
         None, description="Окно сбора доп. сообщений после первого ответа, сек", examples=[3],
     )
+    edit_timeout: float | None = Field(
+        None,
+        description=(
+            "Пока ответ — только заглушка «идёт поиск… подождите», ждать её "
+            "правку/финал до этого лимита, сек. Многие боты редактируют плейсхолдер "
+            "готовым результатом."
+        ),
+        examples=[30],
+    )
 
 
 class AskResponse(BaseModel):
@@ -134,6 +143,7 @@ async def ask(
             target=body.target,
             timeout=body.timeout,
             collect_seconds=body.collect_seconds,
+            edit_timeout=body.edit_timeout,
         )
     except asyncio.TimeoutError:
         return AskResponse(

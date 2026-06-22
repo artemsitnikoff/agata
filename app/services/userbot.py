@@ -25,6 +25,26 @@ logger = logging.getLogger("agata")
 # Кулдаун на чат — чтобы личный аккаунт не улетел во флуд/бан Telegram.
 SENECA_COOLDOWN_SECONDS = 60
 
+# Маркеры «сообщения-заглушки»: бот прислал плейсхолдер и ещё думает. Пока ответ
+# состоит только из таких сообщений — ждём правку/финал (см. ask_edit_timeout).
+# Сравнение по подстроке в lower(), поэтому маркеры — характерные фразы загрузки,
+# а не эмодзи (эмодзи может оказаться и в реальном ответе → лишнее ожидание).
+PLACEHOLDER_MARKERS = (
+    "подожд",            # «пожалуйста, подождите»
+    "идёт поиск", "идет поиск",
+    "идёт обработ", "идет обработ",
+    "выполняется", "обрабатыва",
+    "загруж",            # «загружаю / загрузка»
+    "ищу", "минуточк", "один момент", "одну секунд", "секундочк",
+    "please wait", "loading", "searching", "processing", "one moment",
+)
+
+
+def _looks_like_placeholder(text: str) -> bool:
+    """True, если текст похож на временную заглушку «идёт поиск… подождите»."""
+    low = text.lower()
+    return any(marker in low for marker in PLACEHOLDER_MARKERS)
+
 
 class UserbotClient:
     def __init__(self) -> None:
@@ -84,24 +104,42 @@ class UserbotClient:
         target: str | None = None,
         timeout: float | None = None,
         collect_seconds: float | None = None,
+        edit_timeout: float | None = None,
     ) -> list[str]:
         """Отправить `text` целевому боту и вернуть его ответ(ы).
 
         target          — переопределить целевого бота (@username/id); по умолчанию settings.target_bot
         timeout         — ожидание ПЕРВОГО ответа, сек (settings.ask_timeout)
         collect_seconds — окно сбора последующих сообщений, сек (settings.ask_collect_seconds)
+        edit_timeout    — пока ответ = только плейсхолдер «идёт поиск…», ждём его
+                          правку/финал до этого лимита, сек (settings.ask_edit_timeout)
 
         Возвращает список текстов ответов (бот может дробить ответ на несколько
-        сообщений). Бросает asyncio.TimeoutError если бот не ответил вовремя.
+        сообщений; плейсхолдеры «идёт поиск…» из финального списка убираются, если
+        есть содержательный ответ). Бросает asyncio.TimeoutError если бот не ответил.
         """
         timeout = settings.ask_timeout if timeout is None else timeout
         collect_seconds = (
             settings.ask_collect_seconds if collect_seconds is None else collect_seconds
         )
+        edit_timeout = (
+            settings.ask_edit_timeout if edit_timeout is None else edit_timeout
+        )
+        # Внутренний таймаут отдельных get_response/get_edit: с запасом больше любого
+        # нашего окна, чтобы их собственный wait_for не срабатывал раньше нашей логики.
+        inner = max(timeout, edit_timeout, collect_seconds) + 5.0
         entity = await self._resolve_target(target)
 
         async with self._ask_lock:
-            replies: list[str] = []
+            by_id: dict[int, str] = {}
+            order: list[int] = []
+
+            def _record(msg) -> None:
+                if msg.id not in by_id:
+                    order.append(msg.id)
+                by_id[msg.id] = msg.raw_text or ""
+
+            resp = edit = None
             try:
                 async with self._client.conversation(
                     entity, timeout=timeout, exclusive=True,
@@ -109,24 +147,73 @@ class UserbotClient:
                     await conv.send_message(text)
                     logger.info("Userbot: → %s: %r", target or settings.target_bot, text[:120])
 
-                    first = await conv.get_response()
-                    if first.raw_text:
-                        replies.append(first.raw_text)
+                    _record(await conv.get_response())
 
-                    # Добираем дополнительные сообщения, пока бот «договаривает».
+                    # Долгоживущие ожидания: новое сообщение И правка. Перевзводим
+                    # ТОЛЬКО сработавшее (проигравшее остаётся pending) — внутри цикла
+                    # ничего не отменяем, иначе можно словить set_result на отменённом
+                    # future Telethon. Финальную отмену делает __aexit__ диалога.
+                    resp = asyncio.ensure_future(conv.get_response(timeout=inner))
+                    edit = asyncio.ensure_future(conv.get_edit(timeout=inner))
+
+                    edit_deadline = time.monotonic() + edit_timeout
                     while True:
-                        try:
-                            nxt = await conv.get_response(timeout=collect_seconds)
-                        except asyncio.TimeoutError:
+                        only_placeholder = bool(by_id) and all(
+                            _looks_like_placeholder(t) for t in by_id.values()
+                        )
+                        if only_placeholder:
+                            budget = edit_deadline - time.monotonic()
+                        else:
+                            budget = collect_seconds
+                        if budget <= 0:
                             break
-                        if nxt.raw_text:
-                            replies.append(nxt.raw_text)
+
+                        done, _pending = await asyncio.wait(
+                            {resp, edit}, timeout=budget,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if not done:  # тишина дольше окна — бот «договорил»
+                            break
+
+                        progressed = False
+                        for task in (resp, edit):  # приоритет: новое сообщение
+                            if task not in done:
+                                continue
+                            try:
+                                msg = task.result()
+                            except (asyncio.TimeoutError, asyncio.CancelledError):
+                                msg = None
+                            if msg is not None:
+                                _record(msg)
+                                progressed = True
+                            if task is resp:
+                                resp = asyncio.ensure_future(conv.get_response(timeout=inner))
+                            else:
+                                edit = asyncio.ensure_future(conv.get_edit(timeout=inner))
+                        if not progressed:  # обе задачи истекли по внутреннему таймауту
+                            break
             except (PeerFloodError, FloodWaitError):
                 logger.error("Userbot: Telegram rate-limit/flood при ask")
                 raise
+            finally:
+                # Диалог уже вышел из контекста (__aexit__ снял футуры с диспатча и
+                # отменил их) — здесь лишь подбираем отменённые задачи, чтобы asyncio
+                # не ругался на «никто не забрал результат».
+                for task in (resp, edit):
+                    if task is None:
+                        continue
+                    task.cancel()
+                    try:
+                        await task
+                    except BaseException:
+                        pass
 
+            texts = [by_id[i] for i in order if by_id[i]]
+            meaningful = [t for t in texts if not _looks_like_placeholder(t)]
+            replies = meaningful or texts
             logger.info(
-                "Userbot: ← %s: %d сообщ.", target or settings.target_bot, len(replies),
+                "Userbot: ← %s: %d сообщ. (%d после фильтра заглушек)",
+                target or settings.target_bot, len(texts), len(replies),
             )
             return replies
 
